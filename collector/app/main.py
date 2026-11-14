@@ -9,6 +9,8 @@ GET  /events                 paginated events, filter by path / status /
                              status range / source code
 GET  /events/{event_id}      single event with the raw JSON line
 GET  /malformed              quarantined lines that failed JSON parsing
+GET  /verify/{dev}/{inode}   read-only integrity check of one tracked file
+                             against its committed batch
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import storage
+from . import storage, verifier
 from .ingest import CollectorLoop, poll_once
 
 logging.basicConfig(
@@ -87,6 +89,93 @@ class EventPage(BaseModel):
     offset: int
     next_offset: Optional[int]
     items: list[Event]
+
+
+class VerificationBoundary(BaseModel):
+    committed_offset: int = Field(
+        description="核验开始时已提交的续采位置；只核对 [0, offset) 的字节"
+    )
+    original_size_at_open: Optional[int] = Field(
+        None, description="打开原件时看到的文件大小"
+    )
+    original_size_after_read: Optional[int] = Field(
+        None, description="读完已提交区间后看到的大小（期间可能继续追加）"
+    )
+    line_count: int = Field(0, description="已提交区间内以换行结尾的行数")
+    bytes_after_boundary_ignored: Optional[int] = Field(
+        None, description="边界之后未参与核对的字节数（未换行尾部/未入仓新行）"
+    )
+
+
+class VerificationCounts(BaseModel):
+    original_lines: int = Field(0, description="原件在已提交区间内的完整行数")
+    normal_records: int = Field(0, description="log_events 中该物理文件、边界内的记录数")
+    malformed_records: int = Field(0, description="malformed_lines 中该物理文件、边界内的记录数")
+    matched_lines: int = Field(0, description="逐行原文完全一致的正常记录数")
+    missing_lines: int = Field(0, description="原件有完整行、仓库无任何记录的位置数")
+    duplicate_positions: int = Field(0, description="同一字节位置存在多条记录的位置数")
+    content_mismatches: int = Field(0, description="记录原文与原件不一致的记录数")
+    unexpected_records: int = Field(0, description="仓库有记录、已提交区间中无对应行的记录数")
+
+
+class MissingLine(BaseModel):
+    byte_offset: int
+    raw_line: str
+
+
+class RecordRef(BaseModel):
+    table: str
+    id: int
+    source_code: str
+    raw_line: str
+
+
+class DuplicatePosition(BaseModel):
+    byte_offset: int
+    count: int
+    records: list[RecordRef]
+
+
+class ContentMismatch(BaseModel):
+    byte_offset: int
+    table: str
+    id: int
+    source_code: str
+    original_raw_line: str
+    record_raw_line: str
+
+
+class UnexpectedRecord(BaseModel):
+    byte_offset: int
+    table: str
+    id: int
+    source_code: str
+    raw_line: str
+
+
+class VerificationReport(BaseModel):
+    status: str = Field(description="verified | mismatch | unverified")
+    passed: bool = Field(description="仅 verified 时为 true；未核实不报通过")
+    dev: int
+    inode: int
+    source_code: str
+    source_path: str = Field(description="已提交记录中的来源路径（可能已因轮转而过时）")
+    original_path: Optional[str] = Field(None, description="实际按 inode 找到的原件路径")
+    original_present_at_end: Optional[bool]
+    last_seen: str
+    reason: Optional[str] = Field(None, description="未核实的原因")
+    started_at: str
+    finished_at: Optional[str]
+    duration_ms: Optional[float]
+    boundary: VerificationBoundary
+    counts: VerificationCounts
+    missing_lines: list[MissingLine]
+    duplicate_positions: list[DuplicatePosition]
+    content_mismatches: list[ContentMismatch]
+    unexpected_records: list[UnexpectedRecord]
+    details_truncated: bool = Field(
+        False, description="明细超过 limit 被截断（计数仍为全量）"
+    )
 
 
 state: dict = {}
@@ -244,3 +333,32 @@ def list_malformed(limit: int = Query(100, ge=1, le=1000),
     ).fetchall()
     return {"total": total, "limit": limit, "offset": offset,
             "items": [dict(r) for r in rows]}
+
+
+@app.get("/verify/{dev}/{inode}", response_model=VerificationReport,
+         tags=["verify"])
+def verify_file(
+    dev: int,
+    inode: int,
+    limit: int = Query(
+        500, ge=1, le=10000,
+        description="每类问题明细最多返回多少条；计数始终为全量",
+    ),
+):
+    """按 (设备号, inode) 核验一个已追踪文件是否仍与原件一致。
+
+    只读核对同一物理文件、且位于核验开始时所提交续采位置之前的记录；
+    新文件、轮转后新增来源、尚未换行或尚未入仓的尾部均不参与。
+    原件缺失、被截断或核验期间无法稳定读取时返回 ``unverified``
+    （``passed=false``），绝不报通过。
+    """
+    try:
+        return verifier.verify_tracked_file(
+            DB_PATH, LOG_DIR, dev, inode, detail_limit=limit
+        )
+    except verifier.NotTrackedError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no tracked file with dev={dev} inode={inode}; "
+                   f"see /ingest/progress for dev/inode values",
+        )
